@@ -77,7 +77,7 @@ export default function CentralizedStatusPill({
 
   return (
     <View style={[styles.pillContainer, { borderColor: pillColor }]}>
-      <Text style={styles.pillText} numberOfLines={1}>
+      <Text style={styles.pillText}>
         {resolveMessage()}
       </Text>
     </View>
@@ -90,9 +90,9 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'center',
-    backgroundColor: 'rgba(15, 23, 42, 0.90)',
-    paddingVertical: 9,
-    paddingHorizontal: 20,
+    backgroundColor: 'rgba(15, 23, 42, 0.92)',
+    paddingVertical: 10,
+    paddingHorizontal: 22,
     borderRadius: 22,
     borderWidth: 1.5,
     shadowColor: '#000',
@@ -100,7 +100,7 @@ const styles = StyleSheet.create({
     shadowOpacity: 0.35,
     shadowRadius: 5,
     elevation: 6,
-    maxWidth: 540,
+    maxWidth: '94%',
   },
   pillText: {
     color: '#ffffff',
@@ -108,5 +108,6 @@ const styles = StyleSheet.create({
     fontWeight: '700',
     letterSpacing: 0.3,
     textAlign: 'center',
+    lineHeight: 20,
   },
 });

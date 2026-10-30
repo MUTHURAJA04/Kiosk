@@ -5,7 +5,7 @@ let db = null;
 /**
  * Safely executes a SQL query synchronously using op-sqlite executeSync or async fallback.
  */
-function querySync(database, sql, params = []) {
+export function querySync(database, sql, params = []) {
   if (typeof database.executeSync === 'function') {
     return database.executeSync(sql, params);
   }
@@ -16,7 +16,7 @@ function querySync(database, sql, params = []) {
 /**
  * Safely extracts row objects from op-sqlite query result regardless of SDK version.
  */
-function extractRows(result) {
+export function extractRows(result) {
   if (!result || !result.rows) return [];
   if (Array.isArray(result.rows)) {
     return result.rows;
@@ -414,16 +414,17 @@ export function updateEmployeeEmbedding(employeeId, embeddingArray) {
 /**
  * Permanently deletes an employee and their biometric records.
  */
-export function deleteEmployee(employeeId) {
+export function deleteEmployee(employeeIdOrUuid) {
+  if (!employeeIdOrUuid) return { success: false };
   const database = getDb();
-  const empId = employeeId.trim();
+  const target = String(employeeIdOrUuid).trim();
   querySync(
     database,
-    `DELETE FROM face_templates WHERE user_id IN (SELECT id FROM users WHERE employee_id = ?)`,
-    [empId]
+    `DELETE FROM face_templates WHERE user_id = ? OR user_id IN (SELECT id FROM users WHERE employee_id = ? OR id = ?)`,
+    [target, target, target]
   );
-  querySync(database, `DELETE FROM users WHERE employee_id = ?`, [empId]);
-  return { success: true, employeeId: empId };
+  querySync(database, `DELETE FROM users WHERE employee_id = ? OR id = ?`, [target, target]);
+  return { success: true, target };
 }
 
 /**
@@ -568,6 +569,25 @@ export function logAttendance(user, similarityScore, options = {}) {
 
   console.log(`[OP-SQLite] Log record created: ${logId} (Status: PENDING)`);
   return { id: logId, timestamp, syncStatus: 'PENDING', type };
+}
+
+/**
+ * Gets the most recent punch today for an employee to alternate IN/OUT.
+ */
+export function getLastPunchToday(employeeId) {
+  const database = getDb();
+  const startOfDay = new Date();
+  startOfDay.setHours(0, 0, 0, 0);
+  const startTimestamp = startOfDay.getTime();
+  const result = querySync(
+    database,
+    `SELECT id, user_id, employee_id, type, timestamp FROM attendance_logs 
+     WHERE (employee_id = ? OR user_id = ?) AND timestamp >= ? 
+     ORDER BY timestamp DESC LIMIT 1`,
+    [String(employeeId), String(employeeId), startTimestamp]
+  );
+  const rows = extractRows(result);
+  return rows && rows.length > 0 ? rows[0] : null;
 }
 
 /**

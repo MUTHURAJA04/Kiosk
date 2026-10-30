@@ -12,6 +12,8 @@ import {
   setSettingSync,
 } from '../database/db';
 import { NativeFacePipeline } from './nativeFacePipeline';
+import { supabase } from './supabase';
+import { EmployeeStorage } from './employeeStorage';
 
 let syncTimer = null;
 let isSyncing = false;
@@ -196,39 +198,150 @@ export async function pushAttendanceLogsToCloud() {
     return { pushedCount: 0 };
   }
 
-  const { url, key } = getSupabaseConfig();
-  if (!url || !key || url.includes('xyzcompany')) {
-    const syncedIds = pendingLogs.map((log) => log.id);
-    markLogsSynced(syncedIds);
-    console.log(`[SyncService] Offline mode: Marked ${syncedIds.length} logs as SYNCED locally.`);
-    return { pushedCount: syncedIds.length, simulated: true };
+  const syncedIds = [];
+
+  for (const log of pendingLogs) {
+    try {
+      // Resolve UUID and branch from Supabase employees directory
+      let resolvedEmployeeUuid = null;
+      let branchId = null;
+
+      // 1. Check local in-memory staff cache
+      const localEmp =
+        EmployeeStorage.getEmployeeByIdOrCode(log.employee_id) ||
+        EmployeeStorage.getEmployeeByIdOrCode(log.name);
+
+      if (localEmp && localEmp.id) {
+        resolvedEmployeeUuid = localEmp.id;
+        branchId = localEmp.branch_id || null;
+      }
+
+      // 2. Query Supabase by employee_code
+      if (!resolvedEmployeeUuid && log.employee_id) {
+        const { data: byCode } = await supabase
+          .from('employees')
+          .select('id, branch_id')
+          .eq('employee_code', log.employee_id)
+          .limit(1);
+
+        if (byCode && byCode.length > 0) {
+          resolvedEmployeeUuid = byCode[0].id;
+          branchId = byCode[0].branch_id || null;
+        }
+      }
+
+      // 3. Query Supabase by full_name
+      if (!resolvedEmployeeUuid && log.name) {
+        const { data: byName } = await supabase
+          .from('employees')
+          .select('id, branch_id')
+          .eq('full_name', log.name)
+          .limit(1);
+
+        if (byName && byName.length > 0) {
+          resolvedEmployeeUuid = byName[0].id;
+          branchId = byName[0].branch_id || null;
+        }
+      }
+
+      if (!resolvedEmployeeUuid) {
+        console.warn(`[SyncService] Staff "${log.name}" (${log.employee_id}) not in Supabase employees table. Marking resolved locally.`);
+        syncedIds.push(log.id);
+        continue;
+      }
+
+      if (punchType === 'IN') {
+        const { error } = await supabase.from('attendance_logs').insert([
+          {
+            employee_id: resolvedEmployeeUuid,
+            branch_id: branchId,
+            check_in: punchTime,
+            check_out: null,
+            status: 'PRESENT',
+            source: 'BIOMETRIC',
+            metadata: {
+              similarity_score: log.similarity_score,
+              punch_type: 'IN',
+              employee_name: log.name,
+              client: 'KIOSK_FACE_VERIFIED',
+            },
+          },
+        ]);
+
+        if (error) {
+          console.warn('[SyncService] Supabase Punch-IN error:', error.message);
+          continue;
+        }
+      } else {
+        // Punch OUT: Find today's open punch
+        const startOfDay = new Date(log.timestamp);
+        startOfDay.setHours(0, 0, 0, 0);
+
+        const { data: openLogs } = await supabase
+          .from('attendance_logs')
+          .select('id')
+          .eq('employee_id', resolvedEmployeeUuid)
+          .is('check_out', null)
+          .gte('check_in', startOfDay.toISOString())
+          .order('check_in', { ascending: false })
+          .limit(1);
+
+        if (openLogs && openLogs.length > 0) {
+          const { error: updateError } = await supabase
+            .from('attendance_logs')
+            .update({
+              check_out: punchTime,
+              metadata: {
+                similarity_score: log.similarity_score,
+                punch_type: 'OUT',
+                employee_name: log.name,
+                client: 'KIOSK_FACE_VERIFIED',
+              },
+            })
+            .eq('id', openLogs[0].id);
+
+          if (updateError) {
+            console.warn('[SyncService] Supabase Punch-OUT update error:', updateError.message);
+            continue;
+          }
+        } else {
+          // Fallback insert if no open log found
+          const { error: insertError } = await supabase.from('attendance_logs').insert([
+            {
+              employee_id: resolvedEmployeeUuid,
+              branch_id: branchId,
+              check_in: punchTime,
+              check_out: punchTime,
+              status: 'PRESENT',
+              source: 'BIOMETRIC',
+              metadata: {
+                similarity_score: log.similarity_score,
+                punch_type: 'OUT',
+                employee_name: log.name,
+                client: 'KIOSK_FACE_VERIFIED',
+              },
+            },
+          ]);
+
+          if (insertError) {
+            console.warn('[SyncService] Supabase Punch-OUT insert fallback error:', insertError.message);
+            continue;
+          }
+        }
+      }
+
+      syncedIds.push(log.id);
+    } catch (singleErr) {
+      console.warn('[SyncService] Single log upload error:', singleErr.message);
+    }
   }
 
-  try {
-    console.log(`[SyncService] Pushing ${pendingLogs.length} attendance logs to Supabase...`);
-    const response = await fetch(`${url}/rest/v1/attendance_logs`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        apikey: key,
-        Authorization: `Bearer ${key}`,
-        Prefer: 'resolution=merge-duplicates',
-      },
-      body: JSON.stringify(pendingLogs),
-    });
-
-    if (!response.ok) {
-      throw new Error(`Supabase push logs error: HTTP ${response.status}`);
-    }
-
-    const syncedIds = pendingLogs.map((log) => log.id);
+  if (syncedIds.length > 0) {
     markLogsSynced(syncedIds);
     console.log(`[SyncService] Successfully synced ${syncedIds.length} attendance logs to Supabase.`);
-    return { pushedCount: syncedIds.length };
-  } catch (err) {
-    console.warn('[SyncService] Attendance log sync deferred:', err.message);
-    return { error: err.message, pushedCount: 0 };
   }
+
+  return { pushedCount: syncedIds.length };
 }
 
 /**

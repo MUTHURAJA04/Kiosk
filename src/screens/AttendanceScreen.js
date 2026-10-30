@@ -11,6 +11,7 @@ import {
 import { Camera } from 'react-native-vision-camera-face-detector';
 import { useCameraDevice } from 'react-native-vision-camera';
 import { useIsFocused } from '@react-navigation/native';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import FaceCameraGuideOverlay from '../components/FaceCameraGuideOverlay';
 import CentralizedStatusPill from '../components/CentralizedStatusPill';
@@ -21,7 +22,10 @@ import { captureCameraFrameFile } from '../utils/cameraHelper';
 import { getFaceModel } from '../services/tfliteService';
 import { NativeFacePipeline } from '../services/nativeFacePipeline';
 import { matchFace, FaceMatcher, RECOGNITION_THRESHOLD, MIN_REQUIRED_MARGIN } from '../services/faceMatcher';
-import { checkRecentCooldown, logAttendance } from '../database/db';
+import { checkRecentCooldown, logAttendance, getLastPunchToday } from '../database/db';
+import { pushAttendanceLogsToCloud } from '../services/syncService';
+import { AttendanceService } from '../services/attendanceService';
+import ttsService from '../services/ttsService';
 import { TableLogger } from '../utils/TableLogger';
 import AsyncStorage from '../utils/AsyncStorage';
 
@@ -34,6 +38,7 @@ const QUALITY_HOLD_MS = 100;
 const DEFAULT_PUNCH_COOLDOWN_MS = 5000;
 
 export default function AttendanceScreen() {
+  const insets = useSafeAreaInsets();
   const [hasPermission, setHasPermission] = useState(false);
   const cameraRef = useRef(null);
   const isFocused = useIsFocused();
@@ -172,11 +177,18 @@ export default function AttendanceScreen() {
       AsyncStorage.getItem('@kiosk_debug_logging').then((val) => {
         if (val) TableLogger.setDebugLogging(val === 'true');
       });
+
+      // Background offline punch recovery
+      AttendanceService.syncPendingOfflinePunches().catch(() => {});
+
+      // Warm up native Tamil TTS
+      ttsService.initTts().catch(() => {});
     } else {
       setIsFillLightActive(false);
       setExposureCompensation(0);
       lowLumaStartTimeRef.current = null;
       NativeFacePipeline.restoreScreenBrightness().catch(console.warn);
+      ttsService.stopTts();
     }
   }, [isFocused]);
 
@@ -597,41 +609,50 @@ export default function AttendanceScreen() {
             rejectionStreakRef.current = 0;
             qualityPassStartTimeRef.current = null;
 
-            // 5-Second Cooldown Gate
-            const cooldown = checkRecentCooldown(
-              matchedUser.employeeId,
-              activeCooldownRef.current || DEFAULT_PUNCH_COOLDOWN_MS
-            );
+            // AttendanceService handles: Cooldown Gate, Alternating IN/OUT, Local 0ms Save, and Cloud Sync
+            const punchResult = await AttendanceService.recordPunch({
+              employee: matchedUser,
+              similarityScore: matchScore,
+              cooldownMinutes: 2,
+            });
 
-            if (cooldown.inCooldown) {
-              setFeedbackUser(matchedUser.name);
+            if (punchResult.status === 'DUPLICATE_BLOCKED') {
+              const empName = punchResult.employeeName || matchedUser.name;
+              setFeedbackUser(empName);
               setGuidance({
                 status: 'cooldown',
-                prompt: `Already Logged: ${matchedUser.name}\nPlease wait ${cooldown.remainingSeconds}s`,
-              });
-              scheduleFeedbackReset(2500);
-            } else {
-              // Immediate main-thread UI update
-              setFeedbackUser(matchedUser.name);
-              setGuidance({
-                status: 'success',
-                prompt: `Verified: ${matchedUser.name}`,
+                prompt: `Already Logged: ${empName}\nPlease wait ${punchResult.waitSeconds}s`,
               });
               scheduleFeedbackReset(3000);
 
-              // Detach SQLite I/O and background sync/telemetry inside non-blocking setTimeout
+              // Tamil TTS Duplicate Warning
+              ttsService.speakDuplicateWarning(empName, punchResult.waitSeconds, punchResult.lastType || 'IN');
+            } else if (punchResult.status === 'SUCCESS') {
+              const punch = punchResult.punch;
+              const punchType = punch.type;
+              const empName = punch.employeeName || matchedUser.name;
+
+              // Immediate main-thread UI update
+              setFeedbackUser(empName);
+              setGuidance({
+                status: 'success',
+                prompt: `Verified (${punchType}): ${empName}`,
+              });
+              scheduleFeedbackReset(3000);
+
+              // Tamil TTS Speech
+              if (punchType === 'IN') {
+                ttsService.speakCheckIn(empName, new Date(punch.timestamp));
+              } else {
+                ttsService.speakCheckOut(empName, new Date(punch.timestamp), punchResult.lastPunch?.timestamp);
+              }
+
+              // Background diagnostic logging
               setTimeout(() => {
                 try {
-                  logAttendance(matchedUser, matchScore, {
-                    margin: matchResult?.margin || 0.0,
-                    type: 'IN',
-                    deviceId: 'kiosk_main_terminal',
-                    modelId: 'edgeface_s_g05_fp32_v1',
-                    livenessPassed: 1,
-                  });
                   TableLogger.logAttendanceOutcome({
-                    empId: matchedUser.employeeId,
-                    name: matchedUser.name,
+                    empId: matchedUser.employeeId || punch.employeeCode,
+                    name: empName,
                     score: matchScore,
                     threshold: activeThresholdRef.current,
                     inferenceTimeMs: latency,
@@ -640,13 +661,11 @@ export default function AttendanceScreen() {
                     pitch: facePitch,
                     status: 'VERIFIED',
                   });
-                } catch (bgErr) {
-                  console.error('[AttendanceScreen] Background punch error:', bgErr);
-                }
+                } catch (_) {}
               }, 0);
 
               console.log(
-                `[FaceEngine] Verified: ${matchedUser.name} | Score: ${matchScore.toFixed(3)} | Accumulator: ${voteCount}/${validWindow.length} votes`
+                `[FaceEngine] Verified (${punchType}): ${empName} | Score: ${matchScore.toFixed(3)} | Accumulator: ${voteCount}/${validWindow.length} votes`
               );
             }
             return;
@@ -752,7 +771,7 @@ export default function AttendanceScreen() {
       />
 
       {/* Fixed Centralized Status Pill Container (Safe Zone Above Face Frame) */}
-      <View style={styles.pillContainer}>
+      <View style={[styles.pillContainer, { top: Math.max(insets.top + 8, 36) }]}>
         <CentralizedStatusPill
           status={guidance.status}
           message={guidance.prompt}

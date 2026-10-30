@@ -13,12 +13,12 @@ import {
 import { Camera } from 'react-native-vision-camera-face-detector';
 import { useCameraDevice } from 'react-native-vision-camera';
 import { useIsFocused } from '@react-navigation/native';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import FaceCameraGuideOverlay from '../components/FaceCameraGuideOverlay';
 import CentralizedStatusPill from '../components/CentralizedStatusPill';
 import RegistrationStepDots from '../components/RegistrationStepDots';
 import LowLightFillLightOverlay from '../components/LowLightFillLightOverlay';
-import BiometricConsentModal from '../components/BiometricConsentModal';
 import { useFaceQualityValidator } from '../hooks/useFaceQualityValidator';
 import { calculateUiBoundingBox } from '../preprocessing/FaceQualityGate';
 import { captureCameraFrameFile } from '../utils/cameraHelper';
@@ -30,6 +30,8 @@ import {
 } from '../services/faceMatcher';
 import { saveEmployeeWithTemplates } from '../database/db';
 import { flightRecorder } from '../utils/DiagnosticFlightRecorder';
+import { EmployeeStorage } from '../services/employeeStorage';
+import { useAdminSecurity } from '../context/AdminSecurityContext';
 
 /**
  * Phase 2: Guided 5-Pose Progression Specification
@@ -143,42 +145,50 @@ const MemoizedCamera = React.memo(function MemoizedCamera({
 });
 
 export default function RegisterScreen({ route, navigation }) {
-  const { employeeId = 'EMP-001', fullName = 'Employee', mode = 'enroll' } =
-    route?.params || {};
+  const {
+    employee,
+    employeeId = 'EMP-001',
+    fullName = 'Employee',
+    mode = 'enroll',
+  } = route?.params || {};
 
   const { width: winWidth, height: winHeight } = useWindowDimensions();
+  const insets = useSafeAreaInsets();
   const [hasPermission, setHasPermission] = useState(false);
   const isFocused = useIsFocused();
+  const { resetInactivityTimer } = useAdminSecurity();
   const device = useCameraDevice('front');
   const cameraRef = useRef(null);
 
   const [currentPoseIndex, setCurrentPoseIndex] = useState(0);
   const [holdProgress, setHoldProgress] = useState(0); // 0.0 to 1.0
   const [isSuccess, setIsSuccess] = useState(false);
+  const [collisionDetails, setCollisionDetails] = useState(null);
+  const isCollisionBlockedRef = useRef(false);
   const [livenessVerified, setLivenessVerified] = useState(false);
   const [isFillLightActive, setIsFillLightActive] = useState(false);
   const [exposureCompensation, setExposureCompensation] = useState(0);
-  const [showConsentModal, setShowConsentModal] = useState(true);
-  const showConsentModalRef = useRef(true);
   const isSuccessRef = useRef(false);
+  const redirectTimeoutRef = useRef(null);
   const previewSizeRef = useRef({ width: winWidth, height: winHeight });
-  const consentTimestampRef = useRef(null);
   const lowLumaStartTimeRef = useRef(null);
   const leftYawSignRef = useRef(0);
   const lastLiveYawRef = useRef(0);
   const lastMatchedTimeRef = useRef(0);
 
-  const handleAcceptConsent = useCallback(() => {
-    consentTimestampRef.current = Date.now();
-    showConsentModalRef.current = false;
-    setShowConsentModal(false);
-  }, []);
+  useEffect(() => {
+    if (isFocused) {
+      resetInactivityTimer();
+    }
+  }, [isFocused, resetInactivityTimer]);
 
-  const handleDeclineConsent = useCallback(() => {
-    showConsentModalRef.current = false;
-    setShowConsentModal(false);
-    navigation.goBack();
-  }, [navigation]);
+  useEffect(() => {
+    return () => {
+      if (redirectTimeoutRef.current) {
+        clearTimeout(redirectTimeoutRef.current);
+      }
+    };
+  }, []);
 
   const handleCameraError = useCallback((err) => {
     if (!err?.message?.includes('OperationCanceledException')) {
@@ -319,42 +329,53 @@ export default function RegisterScreen({ route, navigation }) {
         throw new Error('Enrollment error: Frontal template missing from burst collection.');
       }
 
-      // 2. Calibrated Biometric Collision Guard vs Existing Enrolled Gallery
-      const existingTemplates = FaceMatcher.getEnrolledTemplates();
+      // 2. Comprehensive Biometric Collision Guard vs Existing Enrolled Gallery & Supabase Cloud
+      setGuidance({
+        status: 'verifying',
+        prompt: 'Verifying face uniqueness against database & cloud...',
+      });
+
+      const currentEmpObj = employee || {
+        id: employeeId?.trim(),
+        employee_code: employeeId?.trim(),
+        full_name: fullName?.trim(),
+      };
+
+      const uniquenessResult = await EmployeeStorage.verifyFaceUniqueness({
+        candidateEmbedding: frontalTemplate.embedding,
+        currentEmployee: currentEmpObj,
+        threshold: ENROLLMENT_COLLISION_THRESHOLD,
+      });
+
       const collisionLines = [];
-      let collisionDetected = false;
-      let collidedUser = null;
-      let highestCollisionSim = 0;
+      if (uniquenessResult.isDuplicate) {
+        const matched = uniquenessResult.matchedEmployee;
+        const matchedName = matched?.full_name || matched?.name || 'Registered Employee';
+        const matchedCode = matched?.employee_code || matched?.employeeId || matched?.id || 'ID-N/A';
+        const simPct = (uniquenessResult.similarity * 100).toFixed(1);
+        const sourceLabel =
+          uniquenessResult.source === 'SUPABASE_CLOUD'
+            ? 'Supabase Cloud'
+            : uniquenessResult.source === 'LOCAL_STORAGE'
+            ? 'Local Storage'
+            : 'Local SQLite Database';
 
-      for (const enrolled of existingTemplates) {
-        const enrolledEmpId = (enrolled.employeeId || '').trim();
-        if (enrolledEmpId === employeeId.trim()) {
-          continue; // Allow re-enrollment / update of the same employee
-        }
-        const sim = cosineSimilarity(frontalTemplate.embedding, enrolled.embedding);
-        if (sim > highestCollisionSim) {
-          highestCollisionSim = sim;
-        }
+        setCollisionDetails({
+          matchedName,
+          matchedCode,
+          similarityPercent: simPct,
+          source: sourceLabel,
+        });
 
-        const isSafe = sim < ENROLLMENT_COLLISION_THRESHOLD;
         collisionLines.push(
-          `  - vs "${enrolled.name}" (${enrolledEmpId}) [${enrolled.poseTag}]: Sim=${sim.toFixed(4)} | Guard=${ENROLLMENT_COLLISION_THRESHOLD} -> [${isSafe ? 'SAFE' : 'COLLISION_ALERT'}]`
+          `  - vs "${matchedName}" (${matchedCode}) [${sourceLabel}]: Sim=${uniquenessResult.similarity.toFixed(4)} | Guard=${ENROLLMENT_COLLISION_THRESHOLD} -> [COLLISION_ALERT]`
         );
 
-        if (!isSafe) {
-          collisionDetected = true;
-          collidedUser = enrolled;
-        }
-      }
-
-      if (existingTemplates.length === 0 || collisionLines.length === 0) {
-        collisionLines.push('  - vs Gallery: Gallery is empty -> [SAFE & UNIQUE]');
-      }
-
-      if (collisionDetected) {
         throw new Error(
-          `COLLISION_ERROR: Face template is too similar to registered employee "${collidedUser.name}" (${highestCollisionSim.toFixed(3)} >= ${ENROLLMENT_COLLISION_THRESHOLD})`
+          `COLLISION_ERROR: Face already enrolled for "${matchedName}" (${matchedCode}) in ${sourceLabel} (${simPct}% similarity). Duplicate enrollment not permitted.`
         );
+      } else {
+        collisionLines.push('  - vs Enrolled Directory: No collisions found -> [SAFE & UNIQUE]');
       }
 
       // 3. Passive Liveness Check Evaluation
@@ -387,11 +408,29 @@ export default function RegisterScreen({ route, navigation }) {
         });
       }
 
-      // 5. Persistence to SQLite face_templates & users tables with DPDP consent metadata
-      saveEmployeeWithTemplates(employeeId.trim(), fullName.trim(), encryptedTemplates, {
-        consentTimestamp: consentTimestampRef.current || Date.now(),
-        consentVersion: 'DPDP-2023-v1',
-      });
+      // 5. Persistence to SQLite face_templates & users tables
+      saveEmployeeWithTemplates(employeeId.trim(), fullName.trim(), encryptedTemplates);
+
+      // 5B. Supabase & Two-Tier Cloud Sync
+      let cloudSynced = false;
+      try {
+        const frontalTpl = templates.find((t) => t.poseTag === 'frontal') || templates[0];
+        const empPayload = employee || {
+          id: employeeId.trim(),
+          full_name: fullName.trim(),
+          employee_code: employeeId.trim(),
+          status: 'ACTIVE',
+        };
+        const cloudRes = await EmployeeStorage.saveEmployeeFaceCloudAndLocal({
+          employee: empPayload,
+          template: frontalTpl.embedding,
+          skipDuplicateCheck: false,
+        });
+        cloudSynced = Boolean(cloudRes?.cloudSynced);
+        console.log(`[RegisterScreen] Cloud push completed: synced=${cloudSynced}`);
+      } catch (cloudErr) {
+        console.warn('[RegisterScreen] Cloud push error:', cloudErr.message);
+      }
 
       // 6. Synchronous RAM & Native Continuous Gallery Reload
       FaceMatcher.loadEnrolledUsersSync();
@@ -438,13 +477,30 @@ FINAL VERDICT: ENROLLMENT SUCCESSFUL
 
       setGuidance({
         status: 'success',
-        prompt: `Face successfully enrolled for ${fullName}!`,
+        prompt: `✔ Enrollment Successful • ${fullName} enrolled!`,
       });
       isSuccessRef.current = true;
       setIsSuccess(true);
+
+      // Clean up camera and detection states so app transitions smoothly
+      isCapturingRef.current = false;
+      lastBoxRef.current = null;
+      setBoundingBox(null);
+
+      // Transient delay (1.4s) allows user to see the success confirmation, then redirects
+      redirectTimeoutRef.current = setTimeout(() => {
+        if (navigation?.canGoBack()) {
+          navigation.goBack();
+        } else {
+          navigation?.navigate('EnrollmentList');
+        }
+      }, 1400);
     } catch (err) {
       console.error('[RegisterScreen] Enrollment finalization error:', err.message);
       const isCollision = err.message && err.message.startsWith('COLLISION_ERROR');
+      if (isCollision) {
+        isCollisionBlockedRef.current = true;
+      }
       setGuidance({
         status: 'error',
         prompt: isCollision
@@ -593,9 +649,9 @@ FINAL VERDICT: ENROLLMENT SUCCESSFUL
     async (faces) => {
       const now = Date.now();
       if (
-        showConsentModalRef.current ||
         isCapturingRef.current ||
         isSuccessRef.current ||
+        isCollisionBlockedRef.current ||
         now - lastProcessedTimeRef.current < 75
       ) {
         return;
@@ -799,7 +855,7 @@ FINAL VERDICT: ENROLLMENT SUCCESSFUL
       />
 
       {/* Centralized Status Pill Container */}
-      <View style={styles.pillContainer}>
+      <View style={[styles.pillContainer, { top: Math.max(insets.top + 8, 36) }]}>
         <CentralizedStatusPill
           status={guidance.status}
           message={guidance.prompt}
@@ -808,7 +864,7 @@ FINAL VERDICT: ENROLLMENT SUCCESSFUL
       </View>
 
       {/* Guided 5-Stage Step Dots with Hold Progress Bar */}
-      <View style={styles.stepDotsContainer}>
+      <View style={[styles.stepDotsContainer, { bottom: Math.max(insets.bottom + 24, 40) }]}>
         <RegistrationStepDots
           current={enrolledTemplatesRef.current.length}
           total={ENROLLMENT_POSES.length}
@@ -817,41 +873,66 @@ FINAL VERDICT: ENROLLMENT SUCCESSFUL
         />
       </View>
 
-      {/* Success Completion Dialog */}
-      <Modal visible={isSuccess} transparent={true} animationType="fade">
-        <View style={styles.modalBackdrop}>
-          <View style={styles.modalCard}>
-            <View style={styles.successIconBadge}>
-              <Text style={styles.successIconText}>✔</Text>
+      {/* Transient Success Banner Notification */}
+      {isSuccess && (
+        <View style={[styles.successBannerContainer, { top: Math.max(insets.top + 8, 36) }]}>
+          <View style={styles.successBannerCard}>
+            <Text style={styles.successBannerIcon}>✔</Text>
+            <View style={styles.successBannerTextCol}>
+              <Text style={styles.successBannerTitle}>Enrollment Successful</Text>
+              <Text style={styles.successBannerSubtitle}>
+                {fullName} ({employeeId}) enrolled
+              </Text>
             </View>
-            <Text style={styles.modalTitle}>Multi-Template Enrollment Complete!</Text>
+          </View>
+        </View>
+      )}
+
+      {/* Biometric Collision Alert Dialog */}
+      <Modal visible={Boolean(collisionDetails)} transparent={true} animationType="fade">
+        <View style={styles.modalBackdrop}>
+          <View style={[styles.modalCard, { borderColor: '#ef4444' }]}>
+            <View style={[styles.successIconBadge, { backgroundColor: '#ef4444' }]}>
+              <Text style={styles.successIconText}>⚠️</Text>
+            </View>
+            <Text style={[styles.modalTitle, { color: '#f87171' }]}>Duplicate Face Detected</Text>
             <Text style={styles.modalMessage}>
-              <Text style={styles.boldText}>{fullName}</Text> (ID:{' '}
-              <Text style={styles.boldText}>{employeeId}</Text>) has been registered with{' '}
-              <Text style={styles.boldText}>5 distinct pose templates</Text> and passive 3D liveness verification.
+              This face is already registered in the system under:{'\n\n'}
+              <Text style={styles.boldText}>{collisionDetails?.matchedName}</Text>
+              {'\n'}Staff Code: <Text style={styles.boldText}>{collisionDetails?.matchedCode}</Text>
+              {'\n'}Biometric Similarity: <Text style={[styles.boldText, { color: '#f87171' }]}>{collisionDetails?.similarityPercent}%</Text>
+              {'\n'}Detected in: <Text style={styles.boldText}>{collisionDetails?.source}</Text>
+              {'\n\n'}
+              The same person cannot be enrolled under multiple employee accounts.
             </Text>
 
-            <TouchableOpacity
-              style={styles.modalPrimaryButton}
-              onPress={handleReturnToDirectory}
-              activeOpacity={0.8}
-            >
-              <Text style={styles.modalPrimaryButtonText}>
-                Return to Employee Directory
-              </Text>
-            </TouchableOpacity>
+            <View style={{ flexDirection: 'row', width: '100%', gap: 12 }}>
+              <TouchableOpacity
+                style={[styles.modalPrimaryButton, { flex: 1, backgroundColor: '#334155' }]}
+                onPress={() => {
+                  setCollisionDetails(null);
+                  isCollisionBlockedRef.current = false;
+                  setGuidance({
+                    status: 'idle',
+                    prompt: 'Align face inside guide frame to retry',
+                  });
+                }}
+                activeOpacity={0.8}
+              >
+                <Text style={styles.modalPrimaryButtonText}>Retry</Text>
+              </TouchableOpacity>
+
+              <TouchableOpacity
+                style={[styles.modalPrimaryButton, { flex: 1, backgroundColor: '#ef4444' }]}
+                onPress={handleReturnToDirectory}
+                activeOpacity={0.8}
+              >
+                <Text style={styles.modalPrimaryButtonText}>Back to List</Text>
+              </TouchableOpacity>
+            </View>
           </View>
         </View>
       </Modal>
-
-      {/* Phase 5: DPDP-Aligned Biometric Consent Modal */}
-      <BiometricConsentModal
-        visible={showConsentModal}
-        employeeName={fullName}
-        employeeId={employeeId}
-        onAccept={handleAcceptConsent}
-        onDecline={handleDeclineConsent}
-      />
     </View>
   );
 }
@@ -879,6 +960,49 @@ const styles = StyleSheet.create({
     right: 16,
     alignItems: 'center',
     zIndex: 20,
+  },
+  successBannerContainer: {
+    position: 'absolute',
+    top: 36,
+    left: 20,
+    right: 20,
+    zIndex: 99,
+    alignItems: 'center',
+  },
+  successBannerCard: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: 'rgba(6, 78, 59, 0.95)',
+    borderWidth: 1.5,
+    borderColor: '#10b981',
+    borderRadius: 16,
+    paddingVertical: 12,
+    paddingHorizontal: 20,
+    shadowColor: '#10b981',
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.5,
+    shadowRadius: 12,
+    elevation: 8,
+  },
+  successBannerIcon: {
+    fontSize: 22,
+    color: '#10b981',
+    fontWeight: '900',
+    marginRight: 12,
+  },
+  successBannerTextCol: {
+    flexShrink: 1,
+  },
+  successBannerTitle: {
+    fontSize: 16,
+    fontWeight: '800',
+    color: '#ffffff',
+  },
+  successBannerSubtitle: {
+    fontSize: 13,
+    color: '#a7f3d0',
+    marginTop: 2,
+    fontWeight: '600',
   },
   stepDotsContainer: {
     position: 'absolute',

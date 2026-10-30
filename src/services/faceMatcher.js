@@ -11,7 +11,8 @@ export const MIN_SEPARATION_MARGIN = MIN_REQUIRED_MARGIN;
 export const RECOGNITION_THRESHOLD = VERIFICATION_THRESHOLD;
 export const NULL_REJECTION_THRESHOLD = RECOGNITION_THRESHOLD;
 export const MIN_CANDIDATE_MARGIN = MIN_REQUIRED_MARGIN;
-export const ENROLLMENT_COLLISION_THRESHOLD = 0.84; // Threshold to prevent duplicate enrollment of same person
+// Calibrated threshold to prevent duplicate enrollment while allowing distinct individuals (max inter-person ~0.31)
+export const ENROLLMENT_COLLISION_THRESHOLD = 0.72;
 
 /**
  * Calculates Cosine Similarity between two L2-normalized Float32 vectors in RAM.

@@ -4,6 +4,13 @@
     <style name="AppTheme" parent="Theme.AppCompat.DayNight.NoActionBar">
         <!-- Customize your theme here. -->
         <item name="android:editTextBackground">@drawable/rn_edit_text_material</item>
+        
+        <!-- Kiosk System Overlap & Layout Config -->
+        <item name="android:fitsSystemWindows">false</item>
+        <item name="android:windowTranslucentStatus">false</item>
+        <item name="android:windowTranslucentNavigation">false</item>
+        <item name="android:navigationBarColor">#0f172a</item>
+        <item name="android:windowLightNavigationBar">false</item>
     </style>
 
 </resources>

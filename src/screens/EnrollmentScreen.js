@@ -6,44 +6,35 @@ import {
   TextInput,
   TouchableOpacity,
   FlatList,
-  Modal,
-  Alert,
+  RefreshControl,
   ActivityIndicator,
-  KeyboardAvoidingView,
-  Platform,
-  ScrollView,
-  useWindowDimensions,
+  StatusBar,
 } from 'react-native';
 import { useIsFocused } from '@react-navigation/native';
-import {
-  getAllEmployees,
-  createOrUpdateEmployeeBasicInfo,
-  deleteEmployee,
-} from '../database/db';
-import { FaceMatcher } from '../services/faceMatcher';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
+import { EmployeeStorage } from '../services/employeeStorage';
+import { useAdminSecurity } from '../context/AdminSecurityContext';
+
+const FILTER_TABS = ['ALL', 'ENROLLED', 'PENDING'];
 
 export default function EnrollmentScreen({ navigation }) {
   const isFocused = useIsFocused();
-  const { width: winWidth, height: winHeight } = useWindowDimensions();
-  const isCompact = winWidth < 400;
+  const insets = useSafeAreaInsets();
+  const { resetInactivityTimer } = useAdminSecurity();
 
   const [employees, setEmployees] = useState([]);
   const [searchQuery, setSearchQuery] = useState('');
+  const [activeFilter, setActiveFilter] = useState('ALL');
   const [isLoading, setIsLoading] = useState(false);
-
-  // Add Employee Modal state
-  const [isModalVisible, setIsModalVisible] = useState(false);
-  const [newFullName, setNewFullName] = useState('');
-  const [newEmployeeId, setNewEmployeeId] = useState('');
-  const [modalError, setModalError] = useState('');
+  const [isRefreshing, setIsRefreshing] = useState(false);
 
   /**
-   * Refreshes employee list from SQLite
+   * Loads employees from local storage & in-memory cache
    */
-  const loadEmployees = useCallback(() => {
+  const loadLocalEmployees = useCallback(async () => {
     setIsLoading(true);
     try {
-      const list = getAllEmployees();
+      const list = await EmployeeStorage.getAllEmployees();
       setEmployees(list || []);
     } catch (err) {
       console.error('[EnrollmentScreen] Load employees error:', err);
@@ -52,394 +43,250 @@ export default function EnrollmentScreen({ navigation }) {
     }
   }, []);
 
-  // Reload whenever screen gains focus
+  /**
+   * Pulls fresh updates from Supabase cloud
+   */
+  const handleRefresh = useCallback(async () => {
+    setIsRefreshing(true);
+    try {
+      const updatedList = await EmployeeStorage.syncEmployeesFromCloud();
+      setEmployees(updatedList || []);
+    } catch (err) {
+      console.warn('[EnrollmentScreen] Cloud sync error:', err);
+    } finally {
+      setIsRefreshing(false);
+    }
+  }, []);
+
+  // Reload local state whenever screen gains focus & reset inactivity timer
   useEffect(() => {
     if (isFocused) {
-      loadEmployees();
+      resetInactivityTimer();
+      loadLocalEmployees();
     }
-  }, [isFocused, loadEmployees]);
+  }, [isFocused, loadLocalEmployees, resetInactivityTimer]);
 
-  // Filtered employees by search query
+  // Subscribe to live employee directory changes (e.g. web deletions/updates)
+  useEffect(() => {
+    const unsubscribe = EmployeeStorage.addListener((updatedList) => {
+      setEmployees(updatedList || []);
+    });
+    return () => {
+      if (unsubscribe) unsubscribe();
+    };
+  }, []);
+
+  // Search and Tab filtering
   const filteredEmployees = useMemo(() => {
-    if (!searchQuery.trim()) return employees;
-    const q = searchQuery.toLowerCase().trim();
-    return employees.filter(
-      (emp) =>
-        emp.name.toLowerCase().includes(q) ||
-        emp.employeeId.toLowerCase().includes(q)
-    );
-  }, [employees, searchQuery]);
+    let list = employees;
 
-  // Stats computation
+    // Filter by Tab
+    if (activeFilter === 'ENROLLED') {
+      list = list.filter((e) => e.hasFace && e.template);
+    } else if (activeFilter === 'PENDING') {
+      list = list.filter((e) => !e.hasFace || !e.template);
+    }
+
+    // Filter by Query
+    if (searchQuery.trim()) {
+      const q = searchQuery.toLowerCase().trim();
+      list = list.filter(
+        (emp) =>
+          (emp.full_name && emp.full_name.toLowerCase().includes(q)) ||
+          (emp.name && emp.name.toLowerCase().includes(q)) ||
+          (emp.employee_code && emp.employee_code.toLowerCase().includes(q)) ||
+          (emp.employeeId && emp.employeeId.toLowerCase().includes(q)) ||
+          (emp.department && emp.department.toLowerCase().includes(q)) ||
+          (emp.role && emp.role.toLowerCase().includes(q))
+      );
+    }
+
+    return list;
+  }, [employees, activeFilter, searchQuery]);
+
+  // Overall Statistics
   const stats = useMemo(() => {
     const total = employees.length;
-    const enrolled = employees.filter((e) => e.hasFace).length;
+    const enrolled = employees.filter((e) => e.hasFace && e.template).length;
     const pending = total - enrolled;
     return { total, enrolled, pending };
   }, [employees]);
 
   /**
-   * Handles deleting an employee record
-   */
-  const handleDeleteEmployee = (emp) => {
-    Alert.alert(
-      'Delete Employee?',
-      `Are you sure you want to delete "${emp.name}" (${emp.employeeId}) and any associated biometric records?`,
-      [
-        { text: 'Cancel', style: 'cancel' },
-        {
-          text: 'Delete',
-          style: 'destructive',
-          onPress: () => {
-            deleteEmployee(emp.employeeId);
-            FaceMatcher.loadEnrolledUsersSync();
-            loadEmployees();
-          },
-        },
-      ]
-    );
-  };
-
-  /**
-   * Validates modal fields and returns trimmed values or null
-   */
-  const validateModalInputs = () => {
-    setModalError('');
-    const name = newFullName.trim();
-    const id = newEmployeeId.trim();
-
-    if (!name) {
-      setModalError('Please enter Full Name.');
-      return null;
-    }
-    if (!id) {
-      setModalError('Please enter Employee ID.');
-      return null;
-    }
-
-    // Check unique employeeId
-    const exists = employees.some(
-      (e) => e.employeeId.toLowerCase() === id.toLowerCase()
-    );
-    if (exists) {
-      setModalError(`Employee ID "${id}" is already registered.`);
-      return null;
-    }
-
-    return { name, id };
-  };
-
-  /**
-   * Saves profile in SQLite and closes modal
-   */
-  const handleSaveOnly = () => {
-    const valid = validateModalInputs();
-    if (!valid) return;
-
-    createOrUpdateEmployeeBasicInfo(valid.id, valid.name);
-    setIsModalVisible(false);
-    setNewFullName('');
-    setNewEmployeeId('');
-    loadEmployees();
-  };
-
-  /**
-   * Saves profile in SQLite and directly navigates to camera registration
-   */
-  const handleSaveAndRegister = () => {
-    const valid = validateModalInputs();
-    if (!valid) return;
-
-    createOrUpdateEmployeeBasicInfo(valid.id, valid.name);
-    setIsModalVisible(false);
-    setNewFullName('');
-    setNewEmployeeId('');
-    loadEmployees();
-
-    navigation.navigate('RegisterFace', {
-      employeeId: valid.id,
-      fullName: valid.name,
-      mode: 'enroll',
-    });
-  };
-
-  /**
    * Navigates to dedicated camera face registration
    */
-  const handleNavigateToCapture = (emp, mode = 'enroll') => {
+  const handleNavigateToCapture = (emp) => {
+    const isEnrolled = Boolean(emp.hasFace && emp.template);
     navigation.navigate('RegisterFace', {
-      employeeId: emp.employeeId,
-      fullName: emp.name,
-      mode,
+      employee: emp,
+      employeeId: emp.employee_code || emp.employeeId || emp.id,
+      fullName: emp.full_name || emp.name || 'Employee',
+      mode: isEnrolled ? 'update' : 'enroll',
     });
   };
 
-  const renderInitials = (name) => {
-    if (!name) return '??';
-    const parts = name.trim().split(/\s+/);
-    if (parts.length === 1) return parts[0].substring(0, 2).toUpperCase();
-    return (parts[0][0] + parts[parts.length - 1][0]).toUpperCase();
-  };
-
-  const formatDate = (timestamp) => {
-    if (!timestamp) return '';
-    const d = new Date(timestamp);
-    return d.toLocaleDateString(undefined, {
-      month: 'short',
-      day: 'numeric',
-    });
-  };
-
+  /**
+   * Renders each employee card:
+   * Left: Name + Details (tight spacing, full details without dots)
+   * Right: Vertically centered Enroll / Update button
+   */
   const renderEmployeeItem = ({ item }) => {
+    const name = item.full_name || item.name || 'Unnamed Employee';
+    const code = item.employee_code || item.employeeId || '';
+    const dept = item.department || '';
+    const role = item.role || '';
+    const deptRole = [dept, role].filter(Boolean).join(' · ');
+    const isEnrolled = Boolean(item.hasFace && item.template);
+
     return (
       <View style={styles.employeeCard}>
-        {/* Avatar */}
-        <View
-          style={[
-            styles.avatarBadge,
-            { backgroundColor: item.hasFace ? '#0284c7' : '#475569' },
-          ]}
-        >
-          <Text style={styles.avatarText}>{renderInitials(item.name)}</Text>
-        </View>
-
-        {/* Info Column */}
-        <View style={styles.employeeInfoCol}>
-          <Text style={styles.employeeName} numberOfLines={1}>
-            {item.name}
-          </Text>
-          <Text style={styles.employeeId} numberOfLines={1}>
-            ID: {item.employeeId}
+        {/* Left Side: Name + Full Details (No gap, no dots) */}
+        <View style={styles.cardInfo}>
+          <Text style={styles.nameText} numberOfLines={1} ellipsizeMode="tail">
+            {name}
           </Text>
 
-          {/* Biometric Status Tag */}
-          <View style={styles.statusRow}>
-            {item.hasFace ? (
-              <View style={styles.enrolledBadge}>
-                <Text style={styles.enrolledBadgeText}>
-                  ✔ Enrolled {item.enrolledAt ? `• ${formatDate(item.enrolledAt)}` : ''}
-                </Text>
-              </View>
-            ) : (
-              <View style={styles.pendingBadge}>
-                <Text style={styles.pendingBadgeText}>○ Pending Face Capture</Text>
-              </View>
+          <View style={styles.metaRow}>
+            {Boolean(code && code !== 'ID-N/A') && (
+              <Text style={styles.codeText}>
+                {code}
+              </Text>
+            )}
+
+            {Boolean(deptRole) && (
+              <Text style={styles.deptRoleText}>
+                {deptRole}
+              </Text>
             )}
           </View>
         </View>
 
-        {/* Action Buttons Column */}
-        <View style={styles.actionsCol}>
-          {item.hasFace ? (
-            <TouchableOpacity
-              style={styles.updateFaceButton}
-              onPress={() => handleNavigateToCapture(item, 'update')}
-              activeOpacity={0.7}
-            >
-              <Text style={styles.updateFaceButtonText}>Update Face</Text>
-            </TouchableOpacity>
-          ) : (
-            <TouchableOpacity
-              style={styles.enrollFaceButton}
-              onPress={() => handleNavigateToCapture(item, 'enroll')}
-              activeOpacity={0.7}
-            >
-              <Text style={styles.enrollFaceButtonText}>Enroll Face</Text>
-            </TouchableOpacity>
-          )}
-
-          <TouchableOpacity
-            style={styles.deleteIconButton}
-            onPress={() => handleDeleteEmployee(item)}
-            activeOpacity={0.6}
+        {/* Right Side: Vertically Centered Action Button */}
+        <TouchableOpacity
+          style={[
+            styles.actionButton,
+            isEnrolled ? styles.actionButtonUpdate : styles.actionButtonEnroll,
+          ]}
+          onPress={() => handleNavigateToCapture(item)}
+          activeOpacity={0.7}
+        >
+          <Text
+            style={[
+              styles.actionButtonText,
+              isEnrolled ? styles.actionButtonTextUpdate : styles.actionButtonTextEnroll,
+            ]}
           >
-            <Text style={styles.deleteIconText}>🗑</Text>
-          </TouchableOpacity>
-        </View>
+            {isEnrolled ? 'Update' : 'Enroll'}
+          </Text>
+        </TouchableOpacity>
       </View>
     );
   };
 
   return (
     <View style={styles.container}>
-      {/* Search Bar & Action Header */}
-      <View style={styles.topHeaderContainer}>
-        <View style={styles.topHeader}>
-          <View style={styles.searchBarContainer}>
-            <Text style={styles.searchIcon}>🔍</Text>
-            <TextInput
-              style={styles.searchInput}
-              placeholder="Search by name or ID..."
-              placeholderTextColor="#64748b"
-              value={searchQuery}
-              onChangeText={setSearchQuery}
-              clearButtonMode="while-editing"
-            />
-          </View>
+      <StatusBar barStyle="light-content" backgroundColor="#0f172a" />
 
-          <TouchableOpacity
-            style={styles.addEmployeeButton}
-            onPress={() => {
-              setModalError('');
-              setIsModalVisible(true);
-            }}
-            activeOpacity={0.8}
-          >
-            <Text style={styles.addEmployeeButtonText}>
-              {isCompact ? '+ Add' : '+ Add Employee'}
-            </Text>
-          </TouchableOpacity>
+      {/* Top Stats Banner */}
+      <View style={styles.statsBanner}>
+        <View style={styles.statBox}>
+          <Text style={styles.statNumber}>{stats.total}</Text>
+          <Text style={styles.statLabel}>Total Staff</Text>
+        </View>
+        <View style={styles.statDivider} />
+        <View style={styles.statBox}>
+          <Text style={[styles.statNumber, { color: '#10b981' }]}>{stats.enrolled}</Text>
+          <Text style={styles.statLabel}>Enrolled</Text>
+        </View>
+        <View style={styles.statDivider} />
+        <View style={styles.statBox}>
+          <Text style={[styles.statNumber, { color: '#f59e0b' }]}>{stats.pending}</Text>
+          <Text style={styles.statLabel}>Pending</Text>
         </View>
       </View>
 
-      {/* Directory Stats Bar */}
-      <View style={styles.statsBarContainer}>
-        <View style={styles.statsBar}>
-          <View style={styles.statChip}>
-            <Text style={styles.statLabel}>Total:</Text>
-            <Text style={styles.statValue}>{stats.total}</Text>
-          </View>
-          <View style={[styles.statChip, styles.statChipSuccess]}>
-            <Text style={styles.statLabelSuccess}>Enrolled:</Text>
-            <Text style={styles.statValueSuccess}>{stats.enrolled}</Text>
-          </View>
-          <View style={[styles.statChip, styles.statChipPending]}>
-            <Text style={styles.statLabelPending}>Pending:</Text>
-            <Text style={styles.statValuePending}>{stats.pending}</Text>
-          </View>
+      {/* Search Bar (Full Width, No Sync Button) */}
+      <View style={styles.searchSection}>
+        <View style={styles.searchBar}>
+          <Text style={styles.searchIcon}>🔍</Text>
+          <TextInput
+            style={styles.searchInput}
+            placeholder="Search staff by name, code or role..."
+            placeholderTextColor="#64748b"
+            value={searchQuery}
+            onChangeText={setSearchQuery}
+            autoCorrect={false}
+          />
+          {searchQuery.length > 0 && (
+            <TouchableOpacity onPress={() => setSearchQuery('')} hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}>
+              <Text style={styles.clearSearch}>✕</Text>
+            </TouchableOpacity>
+          )}
         </View>
       </View>
 
-      {/* Employee List */}
+      {/* Filter Tabs */}
+      <View style={styles.filterTabs}>
+        {FILTER_TABS.map((tab) => {
+          const isActive = activeFilter === tab;
+          let label = 'All';
+          if (tab === 'ENROLLED') label = `Enrolled (${stats.enrolled})`;
+          if (tab === 'PENDING') label = `Pending (${stats.pending})`;
+
+          return (
+            <TouchableOpacity
+              key={tab}
+              style={[styles.filterTab, isActive && styles.filterTabActive]}
+              onPress={() => setActiveFilter(tab)}
+              activeOpacity={0.7}
+            >
+              <Text style={[styles.filterTabText, isActive && styles.filterTabTextActive]}>
+                {label}
+              </Text>
+            </TouchableOpacity>
+          );
+        })}
+      </View>
+
+      {/* Employees List */}
       {isLoading && employees.length === 0 ? (
-        <View style={styles.centerContainer}>
-          <ActivityIndicator size="large" color="#0284c7" />
-          <Text style={styles.loadingText}>Loading directory...</Text>
+        <View style={styles.loadingContainer}>
+          <ActivityIndicator size="large" color="#38bdf8" />
+          <Text style={styles.loadingText}>Loading staff directory...</Text>
         </View>
       ) : (
         <FlatList
           data={filteredEmployees}
-          keyExtractor={(item) => item.employeeId}
+          keyExtractor={(item) => String(item.id || item.employee_code || item.employeeId)}
           renderItem={renderEmployeeItem}
-          style={styles.flatList}
-          contentContainerStyle={[styles.listContent, { paddingBottom: 100 }]}
-          keyboardShouldPersistTaps="handled"
+          contentContainerStyle={[
+            styles.listContent,
+            { paddingBottom: Math.max(insets.bottom + 24, 32) },
+          ]}
+          initialNumToRender={15}
+          maxToRenderPerBatch={20}
+          windowSize={7}
+          refreshControl={
+            <RefreshControl
+              refreshing={isRefreshing}
+              onRefresh={handleRefresh}
+              tintColor="#38bdf8"
+              colors={['#38bdf8']}
+            />
+          }
           ListEmptyComponent={
             <View style={styles.emptyContainer}>
               <Text style={styles.emptyIcon}>👥</Text>
-              <Text style={styles.emptyTitle}>
-                {searchQuery ? 'No matching employees' : 'No employees in directory'}
-              </Text>
+              <Text style={styles.emptyTitle}>No Employees Found</Text>
               <Text style={styles.emptySubtitle}>
                 {searchQuery
-                  ? 'Try searching with a different name or employee ID'
-                  : 'Add an employee profile to enroll biometric face data'}
+                  ? 'No staff members match your search criteria.'
+                  : 'Pull down to refresh staff directory.'}
               </Text>
-              {!searchQuery && (
-                <TouchableOpacity
-                  style={styles.emptyAddButton}
-                  onPress={() => setIsModalVisible(true)}
-                >
-                  <Text style={styles.emptyAddButtonText}>+ Add First Employee</Text>
-                </TouchableOpacity>
-              )}
             </View>
           }
         />
       )}
-
-      {/* Add Employee Modal */}
-      <Modal
-        visible={isModalVisible}
-        transparent={true}
-        animationType="fade"
-        onRequestClose={() => setIsModalVisible(false)}
-      >
-        <KeyboardAvoidingView
-          behavior={Platform.OS === 'ios' ? 'padding' : undefined}
-          style={styles.modalOverlay}
-        >
-          <View
-            style={[
-              styles.modalCard,
-              {
-                maxWidth: Math.min(winWidth - 32, 480),
-                maxHeight: Math.min(winHeight - 60, 580),
-              },
-            ]}
-          >
-            <View style={styles.modalHeaderRow}>
-              <Text style={styles.modalTitle}>Add New Employee</Text>
-              <TouchableOpacity
-                onPress={() => setIsModalVisible(false)}
-                hitSlop={{ top: 10, right: 10, bottom: 10, left: 10 }}
-              >
-                <Text style={styles.modalCloseText}>✕</Text>
-              </TouchableOpacity>
-            </View>
-
-            <ScrollView
-              showsVerticalScrollIndicator={false}
-              contentContainerStyle={styles.modalScrollContent}
-              keyboardShouldPersistTaps="handled"
-            >
-              <Text style={styles.modalSubtitle}>
-                Create basic profile then proceed to face biometric registration.
-              </Text>
-
-              {modalError ? (
-                <View style={styles.modalErrorBox}>
-                  <Text style={styles.modalErrorText}>⚠ {modalError}</Text>
-                </View>
-              ) : null}
-
-              <Text style={styles.inputLabel}>Full Name</Text>
-              <TextInput
-                style={styles.modalInput}
-                placeholder="e.g. Jane Doe"
-                placeholderTextColor="#64748b"
-                value={newFullName}
-                onChangeText={(t) => {
-                  setNewFullName(t);
-                  setModalError('');
-                }}
-                autoFocus={true}
-              />
-
-              <Text style={styles.inputLabel}>Employee ID</Text>
-              <TextInput
-                style={styles.modalInput}
-                placeholder="e.g. EMP-1049"
-                placeholderTextColor="#64748b"
-                value={newEmployeeId}
-                onChangeText={(t) => {
-                  setNewEmployeeId(t);
-                  setModalError('');
-                }}
-              />
-
-              {/* Modal Primary Action Buttons */}
-              <TouchableOpacity
-                style={styles.saveAndRegisterButton}
-                onPress={handleSaveAndRegister}
-                activeOpacity={0.8}
-              >
-                <Text style={styles.saveAndRegisterButtonText}>
-                  📸 Save & Register Face
-                </Text>
-              </TouchableOpacity>
-
-              <TouchableOpacity
-                style={styles.saveOnlyButton}
-                onPress={handleSaveOnly}
-                activeOpacity={0.8}
-              >
-                <Text style={styles.saveOnlyButtonText}>Save Profile Only</Text>
-              </TouchableOpacity>
-            </ScrollView>
-          </View>
-        </KeyboardAvoidingView>
-      </Modal>
     </View>
   );
 }
@@ -447,269 +294,180 @@ export default function EnrollmentScreen({ navigation }) {
 const styles = StyleSheet.create({
   container: {
     flex: 1,
-    backgroundColor: '#0f172a',
+    backgroundColor: '#0a0f1d',
   },
-  topHeaderContainer: {
-    backgroundColor: '#0f172a',
-    alignItems: 'center',
-    width: '100%',
-  },
-  topHeader: {
-    width: '100%',
-    maxWidth: 760,
+  statsBanner: {
     flexDirection: 'row',
-    alignItems: 'center',
-    paddingHorizontal: 16,
-    paddingTop: 14,
-    paddingBottom: 10,
-    backgroundColor: '#0f172a',
-  },
-  searchBarContainer: {
-    flex: 1,
-    flexDirection: 'row',
-    alignItems: 'center',
-    backgroundColor: '#1e293b',
+    backgroundColor: '#131d31',
+    marginHorizontal: 16,
+    marginTop: 12,
     borderRadius: 12,
-    paddingHorizontal: 12,
-    height: 46,
-    marginRight: 10,
+    paddingVertical: 12,
     borderWidth: 1,
-    borderColor: '#334155',
+    borderColor: '#1e293b',
+  },
+  statBox: {
+    flex: 1,
+    alignItems: 'center',
+  },
+  statNumber: {
+    fontSize: 20,
+    fontWeight: '800',
+    color: '#f8fafc',
+  },
+  statLabel: {
+    fontSize: 11,
+    color: '#94a3b8',
+    fontWeight: '600',
+    marginTop: 2,
+  },
+  statDivider: {
+    width: 1,
+    backgroundColor: '#1e293b',
+  },
+  searchSection: {
+    paddingHorizontal: 16,
+    marginTop: 12,
+  },
+  searchBar: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: '#131d31',
+    borderRadius: 10,
+    paddingHorizontal: 12,
+    height: 42,
+    borderWidth: 1,
+    borderColor: '#1e293b',
   },
   searchIcon: {
-    fontSize: 16,
+    fontSize: 14,
     marginRight: 8,
   },
   searchInput: {
     flex: 1,
     color: '#f8fafc',
-    fontSize: 15,
-  },
-  addEmployeeButton: {
-    backgroundColor: '#0284c7',
-    paddingVertical: 12,
-    paddingHorizontal: 14,
-    borderRadius: 12,
-    alignItems: 'center',
-    justifyContent: 'center',
-    shadowColor: '#0284c7',
-    shadowOffset: { width: 0, height: 3 },
-    shadowOpacity: 0.3,
-    shadowRadius: 5,
-    elevation: 3,
-  },
-  addEmployeeButtonText: {
-    color: '#ffffff',
     fontSize: 14,
-    fontWeight: '700',
+    paddingVertical: 0,
   },
-  statsBarContainer: {
-    backgroundColor: '#0f172a',
-    alignItems: 'center',
-    width: '100%',
+  clearSearch: {
+    color: '#94a3b8',
+    fontSize: 14,
+    paddingHorizontal: 4,
   },
-  statsBar: {
-    width: '100%',
-    maxWidth: 760,
+  filterTabs: {
     flexDirection: 'row',
     paddingHorizontal: 16,
-    paddingBottom: 12,
-    flexWrap: 'wrap',
-    gap: 8,
+    marginTop: 10,
+    marginBottom: 6,
   },
-  statChip: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    backgroundColor: '#1e293b',
-    paddingHorizontal: 10,
-    paddingVertical: 4,
-    borderRadius: 8,
+  filterTab: {
+    paddingVertical: 6,
+    paddingHorizontal: 14,
+    borderRadius: 20,
+    backgroundColor: '#131d31',
+    marginRight: 8,
     borderWidth: 1,
-    borderColor: '#334155',
+    borderColor: '#1e293b',
   },
-  statLabel: {
+  filterTabActive: {
+    backgroundColor: '#0284c7',
+    borderColor: '#38bdf8',
+  },
+  filterTabText: {
     color: '#94a3b8',
     fontSize: 12,
     fontWeight: '600',
-    marginRight: 4,
   },
-  statValue: {
-    color: '#f8fafc',
-    fontSize: 12,
-    fontWeight: '700',
-  },
-  statChipSuccess: {
-    backgroundColor: 'rgba(34, 197, 94, 0.1)',
-    borderColor: 'rgba(34, 197, 94, 0.3)',
-  },
-  statLabelSuccess: {
-    color: '#4ade80',
-    fontSize: 12,
-    fontWeight: '600',
-    marginRight: 4,
-  },
-  statValueSuccess: {
-    color: '#22c55e',
-    fontSize: 12,
-    fontWeight: '700',
-  },
-  statChipPending: {
-    backgroundColor: 'rgba(245, 158, 11, 0.1)',
-    borderColor: 'rgba(245, 158, 11, 0.3)',
-  },
-  statLabelPending: {
-    color: '#fbbf24',
-    fontSize: 12,
-    fontWeight: '600',
-    marginRight: 4,
-  },
-  statValuePending: {
-    color: '#f59e0b',
-    fontSize: 12,
-    fontWeight: '700',
-  },
-  flatList: {
-    flex: 1,
-    width: '100%',
+  filterTabTextActive: {
+    color: '#ffffff',
   },
   listContent: {
-    width: '100%',
-    maxWidth: 760,
-    alignSelf: 'center',
     paddingHorizontal: 16,
-    paddingBottom: 100,
+    paddingTop: 6,
+    paddingBottom: 24,
   },
+
+  /* Employee Card (Centered Button & Tight Details) */
   employeeCard: {
     flexDirection: 'row',
     alignItems: 'center',
-    backgroundColor: '#1e293b',
-    borderRadius: 16,
-    padding: 14,
-    marginBottom: 10,
+    justifyContent: 'space-between',
+    backgroundColor: '#131d31',
+    borderRadius: 10,
+    paddingVertical: 10,
+    paddingHorizontal: 14,
+    marginBottom: 8,
     borderWidth: 1,
-    borderColor: '#334155',
-    shadowColor: '#000',
-    shadowOffset: { width: 0, height: 2 },
-    shadowOpacity: 0.15,
-    shadowRadius: 4,
-    elevation: 2,
+    borderColor: '#1e293b',
   },
-  avatarBadge: {
-    width: 44,
-    height: 44,
-    borderRadius: 22,
-    justifyContent: 'center',
-    alignItems: 'center',
-    marginRight: 10,
-    flexShrink: 0,
-  },
-  avatarText: {
-    color: '#ffffff',
-    fontSize: 16,
-    fontWeight: '800',
-  },
-  employeeInfoCol: {
+  cardInfo: {
     flex: 1,
-    flexShrink: 1,
-    minWidth: 0,
+    marginRight: 12,
     justifyContent: 'center',
   },
-  employeeName: {
-    color: '#f8fafc',
-    fontSize: 16,
+  nameText: {
+    fontSize: 15,
     fontWeight: '700',
+    color: '#f8fafc',
     marginBottom: 2,
   },
-  employeeId: {
-    color: '#94a3b8',
-    fontSize: 13,
-    fontWeight: '500',
-    marginBottom: 4,
-  },
-  statusRow: {
+  metaRow: {
     flexDirection: 'row',
     alignItems: 'center',
+    flexWrap: 'wrap',
+    marginTop: 2,
   },
-  enrolledBadge: {
-    backgroundColor: 'rgba(34, 197, 94, 0.15)',
-    paddingHorizontal: 8,
-    paddingVertical: 2,
-    borderRadius: 6,
-    borderWidth: 1,
-    borderColor: 'rgba(34, 197, 94, 0.35)',
-  },
-  enrolledBadgeText: {
-    color: '#4ade80',
-    fontSize: 11,
-    fontWeight: '700',
-  },
-  pendingBadge: {
-    backgroundColor: 'rgba(148, 163, 184, 0.12)',
-    paddingHorizontal: 8,
-    paddingVertical: 2,
-    borderRadius: 6,
-    borderWidth: 1,
-    borderColor: 'rgba(148, 163, 184, 0.25)',
-  },
-  pendingBadgeText: {
-    color: '#94a3b8',
-    fontSize: 11,
+  codeText: {
+    fontSize: 12,
     fontWeight: '600',
+    color: '#94a3b8',
+    marginRight: 12,
   },
-  actionsCol: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    marginLeft: 8,
-    flexShrink: 0,
-    gap: 6,
+  deptRoleText: {
+    fontSize: 12,
+    fontWeight: '500',
+    color: '#64748b',
   },
-  enrollFaceButton: {
-    backgroundColor: '#0284c7',
-    paddingVertical: 8,
-    paddingHorizontal: 12,
-    borderRadius: 10,
-    alignItems: 'center',
-  },
-  enrollFaceButtonText: {
-    color: '#ffffff',
-    fontSize: 13,
-    fontWeight: '700',
-  },
-  updateFaceButton: {
-    backgroundColor: 'transparent',
-    borderWidth: 1,
-    borderColor: '#38bdf8',
+  actionButton: {
     paddingVertical: 7,
-    paddingHorizontal: 10,
-    borderRadius: 10,
+    paddingHorizontal: 16,
+    borderRadius: 6,
+    minWidth: 72,
     alignItems: 'center',
+    justifyContent: 'center',
+    alignSelf: 'center',
   },
-  updateFaceButtonText: {
-    color: '#38bdf8',
+  actionButtonEnroll: {
+    backgroundColor: '#0284c7',
+  },
+  actionButtonUpdate: {
+    backgroundColor: '#1e293b',
+    borderWidth: 1,
+    borderColor: '#334155',
+  },
+  actionButtonText: {
     fontSize: 12,
     fontWeight: '700',
   },
-  deleteIconButton: {
-    padding: 6,
-    borderRadius: 8,
-    backgroundColor: '#334155',
+  actionButtonTextEnroll: {
+    color: '#ffffff',
   },
-  deleteIconText: {
-    fontSize: 14,
+  actionButtonTextUpdate: {
+    color: '#38bdf8',
   },
-  centerContainer: {
+
+  loadingContainer: {
     flex: 1,
     justifyContent: 'center',
     alignItems: 'center',
   },
   loadingText: {
     color: '#94a3b8',
-    marginTop: 10,
+    marginTop: 12,
     fontSize: 14,
   },
   emptyContainer: {
     alignItems: 'center',
-    justifyContent: 'center',
     paddingVertical: 60,
     paddingHorizontal: 20,
   },
@@ -718,135 +476,15 @@ const styles = StyleSheet.create({
     marginBottom: 12,
   },
   emptyTitle: {
-    color: '#f8fafc',
     fontSize: 18,
     fontWeight: '700',
+    color: '#f8fafc',
     marginBottom: 6,
   },
   emptySubtitle: {
-    color: '#94a3b8',
-    fontSize: 14,
+    fontSize: 13,
+    color: '#64748b',
     textAlign: 'center',
-    marginBottom: 20,
-  },
-  emptyAddButton: {
-    backgroundColor: '#0284c7',
-    paddingVertical: 12,
-    paddingHorizontal: 20,
-    borderRadius: 12,
-  },
-  emptyAddButtonText: {
-    color: '#ffffff',
-    fontSize: 15,
-    fontWeight: '700',
-  },
-  modalOverlay: {
-    flex: 1,
-    backgroundColor: 'rgba(15, 23, 42, 0.85)',
-    justifyContent: 'center',
-    alignItems: 'center',
-    padding: 20,
-  },
-  modalCard: {
-    width: '100%',
-    maxWidth: 480,
-    maxHeight: '90%',
-    backgroundColor: '#1e293b',
-    borderRadius: 20,
-    padding: 22,
-    borderWidth: 1,
-    borderColor: '#334155',
-    shadowColor: '#000',
-    shadowOffset: { width: 0, height: 6 },
-    shadowOpacity: 0.4,
-    shadowRadius: 12,
-    elevation: 8,
-  },
-  modalScrollContent: {
-    flexGrow: 1,
-  },
-  modalHeaderRow: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-    marginBottom: 4,
-  },
-  modalTitle: {
-    color: '#f8fafc',
-    fontSize: 20,
-    fontWeight: '800',
-  },
-  modalCloseText: {
-    color: '#94a3b8',
-    fontSize: 20,
-    fontWeight: '700',
-    padding: 4,
-  },
-  modalSubtitle: {
-    color: '#94a3b8',
-    fontSize: 13,
-    marginBottom: 16,
-  },
-  modalErrorBox: {
-    backgroundColor: '#7f1d1d',
-    borderColor: '#ef4444',
-    borderWidth: 1,
-    borderRadius: 10,
-    paddingVertical: 8,
-    paddingHorizontal: 12,
-    marginBottom: 14,
-  },
-  modalErrorText: {
-    color: '#fecaca',
-    fontSize: 13,
-    fontWeight: '600',
-    textAlign: 'center',
-  },
-  inputLabel: {
-    color: '#cbd5e1',
-    fontSize: 13,
-    fontWeight: '600',
-    marginBottom: 6,
-  },
-  modalInput: {
-    backgroundColor: '#0f172a',
-    color: '#f8fafc',
-    borderRadius: 12,
-    paddingHorizontal: 14,
-    paddingVertical: 12,
-    fontSize: 15,
-    marginBottom: 16,
-    borderWidth: 1,
-    borderColor: '#334155',
-  },
-  saveAndRegisterButton: {
-    backgroundColor: '#0284c7',
-    paddingVertical: 14,
-    borderRadius: 12,
-    alignItems: 'center',
-    marginBottom: 10,
-    shadowColor: '#0284c7',
-    shadowOffset: { width: 0, height: 3 },
-    shadowOpacity: 0.3,
-    shadowRadius: 6,
-    elevation: 4,
-  },
-  saveAndRegisterButtonText: {
-    color: '#ffffff',
-    fontSize: 15,
-    fontWeight: '700',
-  },
-  saveOnlyButton: {
-    backgroundColor: 'transparent',
-    borderWidth: 1,
-    borderColor: '#475569',
-    paddingVertical: 12,
-    borderRadius: 12,
-    alignItems: 'center',
-  },
-  saveOnlyButtonText: {
-    color: '#cbd5e1',
-    fontSize: 14,
-    fontWeight: '600',
+    maxWidth: 260,
   },
 });
